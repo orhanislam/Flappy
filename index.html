@@ -167,15 +167,16 @@
           logicalWidth: 480,
           logicalHeight: 640,
           groundHeight: 96,
-          gravity: 1200,
-          flapImpulse: 480,
+          gravity: 1000,
+          flapImpulse: 520,
           maxFallSpeed: 900,
-          pipeSpeed: 120,
-          pipeGap: 220,
+          pipeSpeed: 90,
+          pipeGap: 300,
           pipeWidth: 70,
-          pipeIntervalSec: 1.8,
+          pipeIntervalSec: 2.4,
           birdX: 120,
           birdRadius: 14,
+          birdHitRadius: 12,
           cloudCount: 6
         };
 
@@ -263,8 +264,8 @@
         function spawnPipePair() {
           const usableHeight = CONFIG.logicalHeight - CONFIG.groundHeight;
           const gap = CONFIG.pipeGap;
-          const minTop = 40;
-          const maxTop = usableHeight - gap - 60;
+          const minTop = 80;
+          const maxTop = usableHeight - gap - 90;
           const topHeight = minTop + Math.random() * (maxTop - minTop);
           const pipeX = CONFIG.logicalWidth + CONFIG.pipeWidth;
           gameState.pipes.push({
@@ -310,7 +311,7 @@
 
             // Scoring and collisions
             const birdX = CONFIG.birdX;
-            const r = CONFIG.birdRadius;
+            const r = CONFIG.birdHitRadius;
             const birdTop = gameState.birdY - r;
             const birdBottom = gameState.birdY + r;
 
