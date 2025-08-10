@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="dark light" />
-    <title>Flappy Bird (Canvas)</title>
+    <title>Flappy Bird Pro (Canvas)</title>
     <style>
       :root {
         --bg-start: #6ad0ff;
@@ -148,14 +148,15 @@
     <div class="game-wrapper" id="game">
       <div class="hud">
         <div class="chip" id="scoreChip">Score: 0</div>
+        <div class="chip" id="levelChip">Level: 1</div>
         <div class="chip" id="bestChip">Best: 0</div>
       </div>
       <canvas id="canvas" width="480" height="640" aria-label="Flappy Bird Game Area"></canvas>
       <div class="overlay" id="overlay" aria-live="polite">
         <div class="overlay-inner">
-          <h2 class="title" id="overlayTitle">Flappy Bird</h2>
+          <h2 class="title" id="overlayTitle">Flappy Bird Pro</h2>
           <p class="subtitle" id="overlaySubtitle">Tap, click, or press Space to flap</p>
-          <p class="hint">Avoid the pipes. Pass through gaps to score.</p>
+          <p class="hint">Avoid pipes, collect coins, and use power-ups. Press P to pause.</p>
           <button class="btn" id="overlayButton" type="button">Play</button>
         </div>
       </div>
@@ -171,12 +172,29 @@
           flapImpulse: 420,
           maxFallSpeed: 900,
           pipeSpeed: 160,
+          maxPipeSpeed: 300,
           pipeGap: 160,
+          minPipeGap: 110,
           pipeWidth: 70,
           pipeIntervalSec: 1.25,
+          minPipeIntervalSec: 0.9,
           birdX: 120,
           birdRadius: 14,
-          cloudCount: 6
+          cloudCount: 6,
+          difficultyStepScore: 5,
+          movingPipeChance: 0.28,
+          movingAmpMin: 14,
+          movingAmpMax: 48,
+          movingFreqMin: 0.6,
+          movingFreqMax: 1.4,
+          coinChance: 0.35,
+          coinRadius: 9,
+          coinScore: 3,
+          powerUpChance: 0.12,
+          powerUpRadius: 11,
+          slowDurationSec: 4,
+          invulnDurationSec: 0.8,
+          particlePerFlap: 10
         };
 
         const canvas = document.getElementById('canvas');
@@ -187,25 +205,33 @@
         const overlayButton = document.getElementById('overlayButton');
         const scoreChip = document.getElementById('scoreChip');
         const bestChip = document.getElementById('bestChip');
+        const levelChip = document.getElementById('levelChip');
 
         let deviceScale = 1;
         let lastTimestampMs = 0;
         let accumulatedSpawnSec = 0;
 
         const gameState = {
-          mode: 'ready', // 'ready' | 'playing' | 'gameover'
+          mode: 'ready', // 'ready' | 'playing' | 'paused' | 'gameover'
           score: 0,
           best: Number(localStorage.getItem('flappy-best') || 0),
+          bestLevel: Number(localStorage.getItem('flappy-best-level') || 1),
+          level: 1,
           birdY: CONFIG.logicalHeight * 0.45,
           birdV: 0,
           pipes: [],
           groundOffset: 0,
-          clouds: []
+          clouds: [],
+          particles: [],
+          slowTimerSec: 0,
+          invulnTimerSec: 0,
+          shieldCharges: 0
         };
 
         function updateHud() {
           scoreChip.textContent = `Score: ${gameState.score}`;
           bestChip.textContent = `Best: ${gameState.best}`;
+          levelChip.textContent = `Level: ${gameState.level}`;
         }
 
         function resizeCanvasForDpr() {
@@ -219,19 +245,35 @@
         function resetGame() {
           gameState.mode = 'ready';
           gameState.score = 0;
+          gameState.level = 1;
           gameState.birdY = CONFIG.logicalHeight * 0.45;
           gameState.birdV = 0;
           gameState.pipes = [];
           gameState.groundOffset = 0;
           accumulatedSpawnSec = 0;
+          gameState.particles = [];
+          gameState.slowTimerSec = 0;
+          gameState.invulnTimerSec = 0;
+          gameState.shieldCharges = 0;
           seedClouds();
           updateHud();
-          showOverlay('Flappy Bird', 'Tap, click, or press Space to flap', 'Play');
+          showOverlay('Flappy Bird Pro', 'Tap, click, or press Space to flap', 'Play');
         }
 
         function startGame() {
           gameState.mode = 'playing';
           overlay.style.display = 'none';
+        }
+
+        function togglePause() {
+          if (gameState.mode === 'playing') {
+            gameState.mode = 'paused';
+            showOverlay('Paused', 'Press P or click Resume to continue', 'Resume');
+          } else if (gameState.mode === 'paused') {
+            gameState.mode = 'playing';
+            overlay.style.display = 'none';
+            lastTimestampMs = 0; // avoid dt spike
+          }
         }
 
         function endGame() {
@@ -240,8 +282,12 @@
             gameState.best = gameState.score;
             localStorage.setItem('flappy-best', String(gameState.best));
           }
+          if (gameState.level > gameState.bestLevel) {
+            gameState.bestLevel = gameState.level;
+            localStorage.setItem('flappy-best-level', String(gameState.bestLevel));
+          }
           updateHud();
-          showOverlay('Game Over', `Score: ${gameState.score} · Best: ${gameState.best}`, 'Restart');
+          showOverlay('Game Over', `Score: ${gameState.score} · Best: ${gameState.best} · Level: ${gameState.level}`, 'Restart');
         }
 
         function showOverlay(title, subtitle, buttonText) {
@@ -260,83 +306,221 @@
           }));
         }
 
+        function getDifficultyFactor() {
+          // 0 at level 1, approaches 1 as level grows
+          const level = gameState.level;
+          return Math.min(1, Math.max(0, (level - 1) / 12));
+        }
+
+        function getDynamicParams() {
+          const f = getDifficultyFactor();
+          const speed = CONFIG.pipeSpeed + (CONFIG.maxPipeSpeed - CONFIG.pipeSpeed) * f;
+          const gap = CONFIG.pipeGap - (CONFIG.pipeGap - CONFIG.minPipeGap) * f;
+          const interval = CONFIG.pipeIntervalSec - (CONFIG.pipeIntervalSec - CONFIG.minPipeIntervalSec) * f;
+          return { speed, gap, interval };
+        }
+
+        function maybeMovingPipe() {
+          if (Math.random() < CONFIG.movingPipeChance) {
+            const amp = CONFIG.movingAmpMin + Math.random() * (CONFIG.movingAmpMax - CONFIG.movingAmpMin);
+            const freq = CONFIG.movingFreqMin + Math.random() * (CONFIG.movingFreqMax - CONFIG.movingFreqMin);
+            const phase = Math.random() * Math.PI * 2;
+            return { amp, freq, phase, t: 0 };
+          }
+          return null;
+        }
+
         function spawnPipePair() {
           const usableHeight = CONFIG.logicalHeight - CONFIG.groundHeight;
-          const gap = CONFIG.pipeGap;
+          const { gap } = getDynamicParams();
           const minTop = 40;
           const maxTop = usableHeight - gap - 60;
-          const topHeight = minTop + Math.random() * (maxTop - minTop);
+          const baseTopHeight = minTop + Math.random() * (maxTop - minTop);
           const pipeX = CONFIG.logicalWidth + CONFIG.pipeWidth;
+          const moving = maybeMovingPipe();
+
+          const addCoin = Math.random() < CONFIG.coinChance;
+          const addPower = Math.random() < CONFIG.powerUpChance;
+          const centerY = baseTopHeight + gap / 2;
+
           gameState.pipes.push({
             x: pipeX,
             width: CONFIG.pipeWidth,
-            topHeight,
+            baseTopHeight,
+            topHeight: baseTopHeight,
             gap,
-            scored: false
+            scored: false,
+            moving,
+            coinCollected: !addCoin,
+            powerCollected: !addPower,
+            coin: addCoin ? { r: CONFIG.coinRadius } : null,
+            power: addPower ? { type: Math.random() < 0.5 ? 'shield' : 'slow', r: CONFIG.powerUpRadius } : null,
+            centerYOffset: 0,
+            centerY
           });
         }
 
         function handleFlap() {
+          if (gameState.mode === 'paused') return;
           if (gameState.mode === 'ready') {
             startGame();
           }
           if (gameState.mode === 'playing') {
             gameState.birdV = -CONFIG.flapImpulse;
+            emitFlapParticles();
           }
           if (gameState.mode === 'gameover') {
             resetGame();
           }
         }
 
+        function emitFlapParticles() {
+          for (let i = 0; i < CONFIG.particlePerFlap; i++) {
+            const angle = Math.PI + (Math.random() - 0.5) * 0.8;
+            const speed = 60 + Math.random() * 140;
+            gameState.particles.push({
+              x: CONFIG.birdX - 6,
+              y: gameState.birdY + 2,
+              vx: Math.cos(angle) * speed,
+              vy: Math.sin(angle) * speed,
+              life: 0.5 + Math.random() * 0.4,
+              age: 0,
+              color: `rgba(245,168,54,1)`
+            });
+          }
+        }
+
+        function updateParticles(dt) {
+          const p = gameState.particles;
+          for (let i = p.length - 1; i >= 0; i--) {
+            const part = p[i];
+            part.age += dt;
+            part.x += part.vx * dt;
+            part.y += part.vy * dt + 40 * dt; // gravity on particles
+            part.vx *= 0.98;
+            part.vy *= 0.98;
+            if (part.age >= part.life) p.splice(i, 1);
+          }
+        }
+
         function update(dt) {
-          if (gameState.mode === 'playing') {
-            gameState.birdV = Math.min(gameState.birdV + CONFIG.gravity * dt, CONFIG.maxFallSpeed);
-            gameState.birdY += gameState.birdV * dt;
+          if (gameState.mode !== 'playing') return;
 
-            accumulatedSpawnSec += dt;
-            if (accumulatedSpawnSec >= CONFIG.pipeIntervalSec) {
-              accumulatedSpawnSec = 0;
-              spawnPipePair();
+          // Time scale with slow power-up
+          const timeScale = gameState.slowTimerSec > 0 ? 0.55 : 1;
+          const dtEff = dt * timeScale;
+
+          if (gameState.slowTimerSec > 0) gameState.slowTimerSec = Math.max(0, gameState.slowTimerSec - dt);
+          if (gameState.invulnTimerSec > 0) gameState.invulnTimerSec = Math.max(0, gameState.invulnTimerSec - dt);
+
+          // Gravity and movement
+          gameState.birdV = Math.min(gameState.birdV + CONFIG.gravity * dtEff, CONFIG.maxFallSpeed);
+          gameState.birdY += gameState.birdV * dtEff;
+
+          const { speed, interval } = getDynamicParams();
+
+          accumulatedSpawnSec += dtEff;
+          if (accumulatedSpawnSec >= interval) {
+            accumulatedSpawnSec = 0;
+            spawnPipePair();
+          }
+
+          const deltaX = speed * dtEff;
+          for (let i = 0; i < gameState.pipes.length; i++) {
+            const pipe = gameState.pipes[i];
+            pipe.x -= deltaX;
+            if (pipe.moving) {
+              pipe.moving.t += dtEff * pipe.moving.freq * Math.PI * 2;
+              const offset = Math.sin(pipe.moving.t + pipe.moving.phase) * pipe.moving.amp;
+              pipe.topHeight = pipe.baseTopHeight + offset;
+              pipe.centerYOffset = offset;
             }
+          }
 
-            const deltaX = CONFIG.pipeSpeed * dt;
-            for (let i = 0; i < gameState.pipes.length; i++) {
-              gameState.pipes[i].x -= deltaX;
-            }
+          gameState.pipes = gameState.pipes.filter(p => p.x + p.width > -32);
 
-            gameState.pipes = gameState.pipes.filter(p => p.x + p.width > -32);
+          gameState.groundOffset = (gameState.groundOffset + deltaX) % 48;
 
-            gameState.groundOffset = (gameState.groundOffset + deltaX) % 48;
+          // Scoring, collectibles, and collisions
+          const birdX = CONFIG.birdX;
+          const r = CONFIG.birdRadius;
+          const birdTop = gameState.birdY - r;
+          const birdBottom = gameState.birdY + r;
 
-            // Scoring and collisions
-            const birdX = CONFIG.birdX;
-            const r = CONFIG.birdRadius;
-            const birdTop = gameState.birdY - r;
-            const birdBottom = gameState.birdY + r;
+          for (const pipe of gameState.pipes) {
+            const inPipeX = birdX + r > pipe.x && birdX - r < pipe.x + pipe.width;
+            const gapTop = pipe.topHeight;
+            const gapBottom = pipe.topHeight + pipe.gap;
 
-            for (const pipe of gameState.pipes) {
-              const inPipeX = birdX + r > pipe.x && birdX - r < pipe.x + pipe.width;
-              const gapTop = pipe.topHeight;
-              const gapBottom = pipe.topHeight + pipe.gap;
-
-              if (inPipeX && (birdTop < gapTop || birdBottom > gapBottom)) {
-                endGame();
-                break;
-              }
-
-              if (!pipe.scored && pipe.x + pipe.width < birdX - r) {
-                pipe.scored = true;
-                gameState.score += 1;
+            // Coin collection
+            if (pipe.coin && !pipe.coinCollected) {
+              const cx = pipe.x + pipe.width / 2;
+              const cy = pipe.centerY + pipe.centerYOffset;
+              const cr = pipe.coin.r;
+              const dx = (birdX) - cx;
+              const dy = (gameState.birdY) - cy;
+              if (dx * dx + dy * dy <= (r + cr) * (r + cr)) {
+                pipe.coinCollected = true;
+                gameState.score += CONFIG.coinScore;
                 updateHud();
               }
             }
 
-            const ceiling = 0;
-            const groundY = CONFIG.logicalHeight - CONFIG.groundHeight;
-            if (gameState.birdY - r <= ceiling || gameState.birdY + r >= groundY) {
+            // Power-up collection
+            if (pipe.power && !pipe.powerCollected) {
+              const px = pipe.x + pipe.width / 2;
+              const py = pipe.centerY + pipe.centerYOffset;
+              const pr = pipe.power.r;
+              const dx = (birdX) - px;
+              const dy = (gameState.birdY) - py;
+              if (dx * dx + dy * dy <= (r + pr) * (r + pr)) {
+                pipe.powerCollected = true;
+                if (pipe.power.type === 'slow') {
+                  gameState.slowTimerSec = CONFIG.slowDurationSec;
+                } else if (pipe.power.type === 'shield') {
+                  gameState.shieldCharges = Math.min(2, gameState.shieldCharges + 1);
+                }
+              }
+            }
+
+            // Pipe collision
+            if (inPipeX && (birdTop < gapTop || birdBottom > gapBottom)) {
+              if (gameState.invulnTimerSec <= 0 && gameState.shieldCharges > 0) {
+                // Consume a shield and grant brief invulnerability
+                gameState.shieldCharges -= 1;
+                gameState.invulnTimerSec = CONFIG.invulnDurationSec;
+                gameState.birdV = -CONFIG.flapImpulse * 0.6;
+              } else if (gameState.invulnTimerSec <= 0) {
+                endGame();
+                break;
+              }
+            }
+
+            if (!pipe.scored && pipe.x + pipe.width < birdX - r) {
+              pipe.scored = true;
+              gameState.score += 1;
+              // Level up
+              const newLevel = 1 + Math.floor(gameState.score / CONFIG.difficultyStepScore);
+              if (newLevel !== gameState.level) {
+                gameState.level = newLevel;
+              }
+              updateHud();
+            }
+          }
+
+          const ceiling = 0;
+          const groundY = CONFIG.logicalHeight - CONFIG.groundHeight;
+          if ((gameState.birdY - r <= ceiling || gameState.birdY + r >= groundY)) {
+            if (gameState.invulnTimerSec <= 0 && gameState.shieldCharges > 0) {
+              gameState.shieldCharges -= 1;
+              gameState.invulnTimerSec = CONFIG.invulnDurationSec;
+              gameState.birdV = -CONFIG.flapImpulse * 0.6;
+            } else if (gameState.invulnTimerSec <= 0) {
               endGame();
             }
           }
+
+          updateParticles(dtEff);
         }
 
         function drawBackground() {
@@ -350,11 +534,38 @@
           ctx.fillStyle = grad;
           ctx.fillRect(0, 0, w, h);
 
+          // Mountains parallax
+          drawMountains(0.25, '#cfe9f6', 140);
+          drawMountains(0.5, '#a9d4ea', 220);
+
           // Clouds
           for (const cloud of gameState.clouds) {
-            cloud.x -= (5 + cloud.s * 0.08) / 60; // slow drift independent of dt for subtle motion
+            cloud.x -= (5 + cloud.s * 0.08) / 60; // subtle drift
             if (cloud.x < -cloud.r * 3) cloud.x = w + cloud.r * 3;
             drawCloud(cloud.x, cloud.y, cloud.r);
+          }
+        }
+
+        function drawMountains(parallax, color, baseY) {
+          const w = CONFIG.logicalWidth;
+          const h = CONFIG.logicalHeight;
+          const offset = (gameState.groundOffset * parallax) % w;
+          ctx.fillStyle = color;
+          for (let i = -1; i <= 2; i++) {
+            const x = i * w - offset;
+            ctx.beginPath();
+            ctx.moveTo(x + w * 0.1, baseY);
+            ctx.lineTo(x + w * 0.35, baseY - 100);
+            ctx.lineTo(x + w * 0.6, baseY);
+            ctx.closePath();
+            ctx.fill();
+
+            ctx.beginPath();
+            ctx.moveTo(x + w * 0.5, baseY + 20);
+            ctx.lineTo(x + w * 0.75, baseY - 80);
+            ctx.lineTo(x + w * 1.0, baseY + 20);
+            ctx.closePath();
+            ctx.fill();
           }
         }
 
@@ -379,6 +590,20 @@
             drawPipeRect(x, 0, w, topH);
             // Bottom pipe
             drawPipeRect(x, bottomY, w, groundY - bottomY);
+
+            // Coin
+            if (pipe.coin && !pipe.coinCollected) {
+              const cx = x + w / 2;
+              const cy = pipe.centerY + pipe.centerYOffset;
+              drawCoin(cx, cy, pipe.coin.r);
+            }
+
+            // Power-up
+            if (pipe.power && !pipe.powerCollected) {
+              const px = x + w / 2;
+              const py = pipe.centerY + pipe.centerYOffset;
+              drawPowerUp(px, py, pipe.power.r, pipe.power.type);
+            }
           }
         }
 
@@ -389,6 +614,39 @@
           ctx.fillRect(x + 6, y, 8, h);
           ctx.fillStyle = 'rgba(255,255,255,0.15)';
           ctx.fillRect(x + w - 10, y, 6, h);
+        }
+
+        function drawCoin(x, y, r) {
+          const grd = ctx.createRadialGradient(x - r * 0.3, y - r * 0.3, r * 0.1, x, y, r);
+          grd.addColorStop(0, '#fff5c2');
+          grd.addColorStop(1, '#f0c419');
+          ctx.fillStyle = grd;
+          ctx.beginPath();
+          ctx.arc(x, y, r, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(x, y, r * 0.65, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+
+        function drawPowerUp(x, y, r, type) {
+          ctx.save();
+          if (type === 'slow') {
+            ctx.fillStyle = '#6c5ce7';
+          } else {
+            ctx.fillStyle = '#2ed573';
+          }
+          ctx.beginPath();
+          ctx.arc(x, y, r, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = '#fff';
+          ctx.font = 'bold 12px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(type === 'slow' ? 'S' : '🛡', x, y + 1);
+          ctx.restore();
         }
 
         function drawGround() {
@@ -411,9 +669,14 @@
           const y = gameState.birdY;
           const r = CONFIG.birdRadius;
 
-          // Body
           const tilt = Math.max(-0.6, Math.min(0.6, gameState.birdV / CONFIG.maxFallSpeed * 1.2));
           ctx.save();
+
+          // Flicker during invulnerability
+          if (gameState.invulnTimerSec > 0 && Math.floor(performance.now() / 100) % 2 === 0) {
+            ctx.globalAlpha = 0.55;
+          }
+
           ctx.translate(x, y);
           ctx.rotate(tilt);
           ctx.fillStyle = '#ffd166';
@@ -447,6 +710,27 @@
           ctx.fill();
 
           ctx.restore();
+
+          // Shield ring
+          if (gameState.shieldCharges > 0) {
+            ctx.strokeStyle = 'rgba(46, 213, 115, 0.9)';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(x, y, r + 6, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+        }
+
+        function drawParticles() {
+          for (const part of gameState.particles) {
+            const t = Math.max(0, Math.min(1, part.age / part.life));
+            ctx.globalAlpha = 1 - t;
+            ctx.fillStyle = part.color;
+            ctx.beginPath();
+            ctx.arc(part.x, part.y, 3, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.globalAlpha = 1;
+          }
         }
 
         function drawScore() {
@@ -455,6 +739,13 @@
             ctx.font = 'bold 28px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
             ctx.textAlign = 'center';
             ctx.fillText(String(gameState.score), CONFIG.logicalWidth / 2, 54);
+
+            if (gameState.slowTimerSec > 0) {
+              ctx.fillStyle = 'rgba(108,92,231,0.8)';
+              ctx.font = 'bold 14px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+              ctx.textAlign = 'left';
+              ctx.fillText(`SLOW: ${gameState.slowTimerSec.toFixed(1)}s`, 12, 76);
+            }
           }
         }
 
@@ -469,6 +760,7 @@
           drawBackground();
           drawPipes();
           drawGround();
+          drawParticles();
           drawBird();
           drawScore();
 
@@ -480,9 +772,15 @@
             e.preventDefault();
             handleFlap();
           }
-          if (e.code === 'Enter' && gameState.mode === 'gameover') {
+          if (e.code === 'Enter') {
             e.preventDefault();
-            resetGame();
+            if (gameState.mode === 'gameover') resetGame();
+            else if (gameState.mode === 'ready') startGame();
+            else if (gameState.mode === 'paused') togglePause();
+          }
+          if (e.code === 'KeyP') {
+            e.preventDefault();
+            if (gameState.mode === 'playing' || gameState.mode === 'paused') togglePause();
           }
         }
 
@@ -492,14 +790,14 @@
 
         function onVisibilityChange() {
           if (document.hidden && gameState.mode === 'playing') {
-            // Soft pause animation effects by zeroing last timestamp so delta doesn't spike
-            lastTimestampMs = 0;
+            togglePause();
           }
         }
 
         overlayButton.addEventListener('click', () => {
           if (gameState.mode === 'ready') startGame();
           else if (gameState.mode === 'gameover') resetGame();
+          else if (gameState.mode === 'paused') togglePause();
         });
 
         window.addEventListener('keydown', onKey, { passive: false });
